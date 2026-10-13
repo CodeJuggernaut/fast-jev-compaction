@@ -254,16 +254,46 @@ function count(decisions: readonly CallDecision[], reason: CallDecision['reason'
  * sent as state with every batch of questions. Throws when Jev fails or the
  * history cannot be fitted; the caller decides whether to fall back.
  */
+/**
+ * A relayed mesh turn that carries only liveness traffic: a user message from
+ * another session ("Another Claude session sent a message:") whose envelopes are
+ * all type status, ping or ack. These carry no instruction or data, so they are
+ * dropped at compaction together with the assistant's plain-text reply to them.
+ */
+export function isLivenessRelay(message: Message): boolean {
+  if (message.role !== 'user' || message.toolUses.length > 0 || (message.toolResults ?? []).length > 0) return false;
+  if (!message.text.trimStart().startsWith('Another Claude session sent a message:')) return false;
+  const types = [...message.text.matchAll(/"type":\s*"(\w+)"/g)].map((match) => match[1]);
+  return types.length > 0 && types.every((type) => type === 'status' || type === 'ping' || type === 'ack');
+}
+
+/** Drops liveness relays (and the reply right after each) outside the preserved recent tail. */
+export function dropLivenessRelays(messages: readonly Message[], preserveRecent: number): Message[] {
+  const cut = Math.max(0, messages.length - preserveRecent);
+  const out: Message[] = [];
+  for (let i = 0; i < messages.length; i++) {
+    const message = messages[i]!;
+    if (i < cut && isLivenessRelay(message)) {
+      const next = messages[i + 1];
+      if (next && i + 1 < cut && next.role === 'assistant' && next.toolUses.length === 0) i++;
+      continue;
+    }
+    out.push(message);
+  }
+  return out;
+}
+
 export async function compact(
-  messages: readonly Message[],
+  original: readonly Message[],
   asker: JevAsker,
   options: CompactOptions = {},
 ): Promise<CompactResult> {
   const started = Date.now();
   const resolved = resolveOptions(options);
+  const charsBefore = original.reduce((sum, message) => sum + messageChars(message), 0);
+  const messages = dropLivenessRelays(original, resolved.preserveRecentMessages);
   const calls = collectToolCalls(messages, resolved.preserveRecentMessages);
   const candidates = calls.filter((call) => !call.pinned);
-  const charsBefore = messages.reduce((sum, message) => sum + messageChars(message), 0);
 
   let fitted: { tokens: number; stage: string } = { tokens: 0, stage: '' };
   let batches: ToolCall[][] = [];
@@ -291,7 +321,7 @@ export async function compact(
     messages: kept,
     decisions,
     stats: {
-      messagesBefore: messages.length,
+      messagesBefore: original.length,
       messagesAfter: kept.length,
       charsBefore,
       charsAfter: kept.reduce((sum, message) => sum + messageChars(message), 0),
