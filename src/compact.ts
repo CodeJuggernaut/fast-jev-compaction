@@ -255,29 +255,22 @@ function count(decisions: readonly CallDecision[], reason: CallDecision['reason'
  * history cannot be fitted; the caller decides whether to fall back.
  */
 /**
- * A relayed mesh turn that carries only liveness traffic: a user message from
- * another session ("Another Claude session sent a message:") whose envelopes are
- * all type status, ping or ack. These carry no instruction or data, so they are
- * dropped at compaction together with the assistant's plain-text reply to them.
+ * A message relayed into the chat from another session (mesh daemons, peer chats, subagent hand-backs):
+ * a user turn starting "Another Claude session sent a message:". The owner's own words and the assistant's
+ * replies are the chat history; relays live in the mesh log and the board, so they are dropped at compaction.
  */
 export function isLivenessRelay(message: Message): boolean {
   if (message.role !== 'user' || message.toolUses.length > 0 || (message.toolResults ?? []).length > 0) return false;
-  if (!message.text.trimStart().startsWith('Another Claude session sent a message:')) return false;
-  const types = [...message.text.matchAll(/"type":\s*"(\w+)"/g)].map((match) => match[1]);
-  return types.length > 0 && types.every((type) => type === 'status' || type === 'ping' || type === 'ack');
+  return message.text.trimStart().startsWith('Another Claude session sent a message:');
 }
 
-/** Drops liveness relays (and the reply right after each) outside the preserved recent tail. */
+/** Drops relayed messages outside the preserved recent tail; the owner's words and every assistant reply stay. */
 export function dropLivenessRelays(messages: readonly Message[], preserveRecent: number): Message[] {
   const cut = Math.max(0, messages.length - preserveRecent);
   const out: Message[] = [];
   for (let i = 0; i < messages.length; i++) {
     const message = messages[i]!;
-    if (i < cut && isLivenessRelay(message)) {
-      const next = messages[i + 1];
-      if (next && i + 1 < cut && next.role === 'assistant' && next.toolUses.length === 0) i++;
-      continue;
-    }
+    if (i < cut && isLivenessRelay(message)) continue;
     out.push(message);
   }
   return out;
