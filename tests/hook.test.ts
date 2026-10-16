@@ -3,6 +3,8 @@ import {
   compactSession,
   decisionLog,
   decisionLogLines,
+  persistLastCompaction,
+  register,
   resolveHookConfig,
   summarize,
   toSessionMessages,
@@ -145,5 +147,233 @@ describe('compactSession', () => {
     await expect(
       compactSession(transcript(), { ...config, apiKey: 'k' }, async () => ({ status: 500, ok: false, text: 'x' })),
     ).rejects.toThrow(/500/);
+  });
+
+  it('reports the relay count in the summary when relays were dropped', async () => {
+    const config = { ...resolveHookConfig({ preserveRecentMessages: 1 }), apiKey: 'k' };
+    const messages = [
+      message('user', 'Another Claude session sent a message: ping from seat-x'),
+      ...transcript(),
+    ];
+    const { result: output } = await compactSession(messages, config, jevFetch(() => 0.95));
+    expect(output.stats.relaysDropped).toBe(1);
+    expect(summarize(output)).toMatch(/1 relays dropped/);
+  });
+});
+
+describe('last compaction record', () => {
+  const stats = {
+    messagesBefore: 8,
+    messagesAfter: 6,
+    charsBefore: 900,
+    charsAfter: 300,
+    calls: 1,
+    kept: 1,
+    resultsDropped: 0,
+    callsDropped: 0,
+    pinned: 0,
+    relaysDropped: 2,
+    stateTokens: 12,
+    stateStage: 'full',
+    requests: 1,
+    ms: 5,
+  };
+
+  function fakeHost(setImpl?: (key: string, value: unknown) => Promise<void>) {
+    const written: { key: string; value: unknown }[] = [];
+    const logs: string[] = [];
+    const $ = {
+      session: { id: async () => 'ses-42' },
+      store: {
+        set:
+          setImpl ??
+          (async (key: string, value: unknown) => {
+            written.push({ key, value });
+          }),
+      },
+      ui: {
+        log: (text: string) => {
+          logs.push(text);
+        },
+      },
+    };
+    return { $, written, logs };
+  }
+
+  it('persists the applied record with session id, timestamp and stats under one key', async () => {
+    const { $, written } = fakeHost();
+    const before = Date.now();
+    await persistLastCompaction($, { applied: true, stats });
+    expect(written).toHaveLength(1);
+    expect(written[0]!.key).toBe('lastCompaction');
+    const record = written[0]!.value as Record<string, unknown>;
+    expect(record.sessionId).toBe('ses-42');
+    expect(record.applied).toBe(true);
+    expect(record.timestamp).toBeGreaterThanOrEqual(before);
+    expect(record.stats).toEqual(stats);
+    expect(record.fallbackReason).toBeUndefined();
+  });
+
+  it('records a below-minimum fallback with its stats and reason', async () => {
+    const { $, written } = fakeHost();
+    await persistLastCompaction($, {
+      applied: false,
+      stats,
+      fallbackReason: 'below-min-reduction',
+    });
+    const record = written[0]!.value as Record<string, unknown>;
+    expect(record.applied).toBe(false);
+    expect(record.fallbackReason).toBe('below-min-reduction');
+    expect(record.stats).toEqual(stats);
+  });
+
+  it('records an error fallback without stats and caps the reason', async () => {
+    const { $, written } = fakeHost();
+    await persistLastCompaction($, { applied: false, fallbackReason: `boom ${'x'.repeat(500)}` });
+    const record = written[0]!.value as Record<string, unknown>;
+    expect(record.applied).toBe(false);
+    expect(record.stats).toBeUndefined();
+    expect(record.fallbackReason).toHaveLength(200);
+  });
+
+  it('skips the record without failing the compaction when the store rejects', async () => {
+    const { $, logs } = fakeHost(async () => {
+      throw new Error('store full');
+    });
+    await expect(persistLastCompaction($, { applied: true, stats })).resolves.toBeUndefined();
+    expect(logs).toHaveLength(1);
+    expect(logs[0]).toMatch(/last-compaction record skipped \(store full\)/);
+  });
+});
+
+describe('session.compact handler', () => {
+  type SessionCompactHandler = (
+    $: unknown,
+    event: { messages: SessionMessage[] },
+    next: (event: unknown) => unknown,
+  ) => Promise<unknown>;
+
+  function captureSessionCompact(options: Record<string, unknown>): SessionCompactHandler {
+    let handler: SessionCompactHandler | undefined;
+    const on = (name: string, fn: SessionCompactHandler) => {
+      if (name === 'session.compact') handler = fn;
+    };
+    register(on as Parameters<typeof register>[0], options as Parameters<typeof register>[1]);
+    if (!handler) throw new Error('session.compact handler not registered');
+    return handler;
+  }
+
+  function handlerHost(
+    fetchFn: () => Promise<{ status: number; ok: boolean; text: string }>,
+    setImpl?: (key: string, value: unknown) => Promise<void>,
+  ) {
+    const written: { key: string; value: unknown }[] = [];
+    const logs: string[] = [];
+    const $ = {
+      http: { fetch: fetchFn },
+      ui: {
+        log: (text: string) => {
+          logs.push(text);
+        },
+        toast: () => {},
+      },
+      session: { id: async () => 'ses-42' },
+      store: {
+        set:
+          setImpl ??
+          (async (key: string, value: unknown) => {
+            written.push({ key, value });
+          }),
+      },
+    };
+    return { $, written, logs };
+  }
+
+  function nextSpy() {
+    const calls: unknown[] = [];
+    const next = (event: unknown) => {
+      calls.push(event);
+      return 'NEXT';
+    };
+    return { next, calls };
+  }
+
+  it('returns the compacted messages and persists an applied record', async () => {
+    const handler = captureSessionCompact({
+      apiKey: 'k',
+      preserveRecentMessages: 1,
+      minReductionRatio: 0.25,
+    });
+    const { $, written } = handlerHost(jevFetch(() => 0.1));
+    const { next, calls } = nextSpy();
+    const event = { messages: transcript() };
+    const out = (await handler($, event, next)) as { messages: SessionMessage[] };
+    expect(out.messages.length).toBeLessThan(event.messages.length);
+    expect(calls).toHaveLength(0);
+    expect(written).toHaveLength(1);
+    expect(written[0]!.key).toBe('lastCompaction');
+    expect(written[0]!.value).toMatchObject({
+      sessionId: 'ses-42',
+      applied: true,
+      stats: { relaysDropped: 0 },
+    });
+    expect((written[0]!.value as Record<string, unknown>).fallbackReason).toBeUndefined();
+  });
+
+  it('returns next(event) and records below-min-reduction when the reduction is too small', async () => {
+    const handler = captureSessionCompact({
+      apiKey: 'k',
+      preserveRecentMessages: 1,
+      minReductionRatio: 0.25,
+    });
+    const { $, written } = handlerHost(jevFetch(() => 0.95));
+    const { next, calls } = nextSpy();
+    const event = { messages: transcript() };
+    const out = await handler($, event, next);
+    expect(out).toBe('NEXT');
+    expect(calls).toEqual([event]);
+    expect(written).toHaveLength(1);
+    expect(written[0]!.key).toBe('lastCompaction');
+    expect(written[0]!.value).toMatchObject({
+      sessionId: 'ses-42',
+      applied: false,
+      fallbackReason: 'below-min-reduction',
+      stats: { relaysDropped: 0 },
+    });
+  });
+
+  it('returns next(event) and records the error without stats when Jev fails', async () => {
+    const handler = captureSessionCompact({ apiKey: 'k', preserveRecentMessages: 1 });
+    const { $, written } = handlerHost(async () => ({ status: 500, ok: false, text: 'x' }));
+    const { next, calls } = nextSpy();
+    const event = { messages: transcript() };
+    const out = await handler($, event, next);
+    expect(out).toBe('NEXT');
+    expect(calls).toHaveLength(1);
+    expect(written).toHaveLength(1);
+    const record = written[0]!.value as Record<string, unknown>;
+    expect(record.applied).toBe(false);
+    expect(record.stats).toBeUndefined();
+    expect(String(record.fallbackReason)).toMatch(/500/);
+  });
+
+  it('keeps the applied return path when the store rejects', async () => {
+    const handler = captureSessionCompact({
+      apiKey: 'k',
+      preserveRecentMessages: 1,
+      minReductionRatio: 0.25,
+    });
+    const { $, logs } = handlerHost(jevFetch(() => 0.1), async () => {
+      throw new Error('store full');
+    });
+    const { next, calls } = nextSpy();
+    const out = (await handler($, { messages: transcript() }, next)) as {
+      messages: SessionMessage[];
+    };
+    expect(Array.isArray(out.messages)).toBe(true);
+    expect(calls).toHaveLength(0);
+    expect(logs.some((line) => /last-compaction record skipped \(store full\)/.test(line))).toBe(
+      true,
+    );
   });
 });

@@ -50,6 +50,10 @@ function transcript(): Message[] {
   ];
 }
 
+function relay(): Message {
+  return message('user', 'Another Claude session sent a message: ping from seat-x');
+}
+
 type Seen = { state: unknown; questions: string[] };
 
 function fakeJev(answer: (name: string) => number, seen: Seen[] = []): JevAsker {
@@ -386,6 +390,32 @@ describe('compact', () => {
     await expect(compact(transcript(), broken, { preserveRecentMessages: 1 })).rejects.toThrow(
       /Invalid Jev answer/,
     );
+  });
+
+  it('counts relay drops exactly and leaves the recent tail and owner words untouched', async () => {
+    const messages = [
+      message('user', 'Never edit anything under src/generated. Fix the failing test.'),
+      relay(),
+      relay(),
+      call('tool-1', 'Read', { file_path: 'src/a.ts' }, fileA),
+      result('tool-1', fileA),
+      message('assistant', 'reading a.ts'),
+      relay(),
+      message('user', 'go ahead'),
+    ];
+    const output = await compact(messages, fakeJev(() => 0.9), { preserveRecentMessages: 2 });
+    expect(output.stats.relaysDropped).toBe(2);
+    expect(output.stats.messagesBefore).toBe(8);
+    expect(output.stats.messagesAfter).toBe(6);
+    expect(output.messages).toContain(messages[0]);
+    expect(output.messages).toContain(messages[6]);
+    expect(output.messages).not.toContain(messages[1]);
+    expect(output.messages).not.toContain(messages[2]);
+  });
+
+  it('reports zero relays dropped when the transcript holds no relays', async () => {
+    const output = await compact(transcript(), fakeJev(() => 0.95), { preserveRecentMessages: 1 });
+    expect(output.stats.relaysDropped).toBe(0);
   });
 });
 

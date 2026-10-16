@@ -285,6 +285,7 @@ export async function compact(
   const resolved = resolveOptions(options);
   const charsBefore = original.reduce((sum, message) => sum + messageChars(message), 0);
   const messages = dropLivenessRelays(original, resolved.preserveRecentMessages);
+  const relaysDropped = original.length - messages.length;
   const calls = collectToolCalls(messages, resolved.preserveRecentMessages);
   const candidates = calls.filter((call) => !call.pinned);
 
@@ -323,6 +324,7 @@ export async function compact(
       resultsDropped: count(decisions, 'result_dropped'),
       callsDropped: count(decisions, 'call_dropped'),
       pinned: count(decisions, 'pinned'),
+      relaysDropped,
       stateTokens: fitted.tokens,
       stateStage: fitted.stage,
       requests: batches.length,

@@ -182,6 +182,7 @@ export function summarize(result: CompactResult): string {
     stats.kept > 0 ? `${stats.kept} kept` : '',
     stats.resultsDropped > 0 ? `${stats.resultsDropped} results truncated` : '',
     stats.callsDropped > 0 ? `${stats.callsDropped} call_dropped` : '',
+    stats.relaysDropped > 0 ? `${stats.relaysDropped} relays dropped` : '',
     stats.pinned > 0 ? `${stats.pinned} pinned` : '',
   ].filter(Boolean);
   return `${percent(reductionRatio(result))} reduction; ${
@@ -256,6 +257,37 @@ function notify(
   $.ui.toast(text, { timeoutMs: 15_000 });
 }
 
+const FALLBACK_REASON_MAX_CHARS = 200;
+
+/**
+ * Persists the session's latest compaction outcome under one bounded store key,
+ * so the last run stays inspectable across sessions. A store failure is logged
+ * and swallowed: the record must never break the compaction itself.
+ */
+export async function persistLastCompaction(
+  $: {
+    session: { id: () => Promise<string> };
+    store: { set: (key: string, value: unknown) => Promise<void> };
+    ui: { log: (text: string) => void };
+  },
+  outcome: { applied: boolean; stats?: CompactResult['stats']; fallbackReason?: string },
+): Promise<void> {
+  try {
+    const record = {
+      sessionId: await $.session.id(),
+      timestamp: Date.now(),
+      applied: outcome.applied,
+      stats: outcome.stats,
+      fallbackReason: outcome.fallbackReason?.slice(0, FALLBACK_REASON_MAX_CHARS),
+    };
+    await $.store.set('lastCompaction', record);
+  } catch (error) {
+    $.ui.log(
+      `last-compaction record skipped (${error instanceof Error ? error.message : String(error)})`,
+    );
+  }
+}
+
 export const register: Register = (on: On, options: PluginOptions) => {
   const configured = resolveHookConfig(options);
   let compacting = false;
@@ -273,18 +305,28 @@ export const register: Register = (on: On, options: PluginOptions) => {
           $,
           `fallback to built-in summary (below ${percent(config.minReductionRatio)} minimum: ${summarize(result)})`,
         );
+        await persistLastCompaction($, {
+          applied: false,
+          stats: result.stats,
+          fallbackReason: 'below-min-reduction',
+        });
         return next(event);
       }
       notify(
         $,
         `kept ${messages.length}/${event.messages.length} messages, no summary (${summarize(result)})`,
       );
+      await persistLastCompaction($, { applied: true, stats: result.stats });
       return { messages };
     } catch (error) {
       notify(
         $,
         `fallback to built-in summary (${error instanceof Error ? error.message : String(error)})`,
       );
+      await persistLastCompaction($, {
+        applied: false,
+        fallbackReason: error instanceof Error ? error.message : String(error),
+      });
       return next(event);
     }
   });
