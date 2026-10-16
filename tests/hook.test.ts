@@ -3,6 +3,7 @@ import {
   compactSession,
   decisionLog,
   decisionLogLines,
+  persistLastCompaction,
   resolveHookConfig,
   summarize,
   toSessionMessages,
@@ -145,5 +146,101 @@ describe('compactSession', () => {
     await expect(
       compactSession(transcript(), { ...config, apiKey: 'k' }, async () => ({ status: 500, ok: false, text: 'x' })),
     ).rejects.toThrow(/500/);
+  });
+
+  it('reports the relay count in the summary when relays were dropped', async () => {
+    const config = { ...resolveHookConfig({ preserveRecentMessages: 1 }), apiKey: 'k' };
+    const messages = [
+      message('user', 'Another Claude session sent a message: ping from seat-x'),
+      ...transcript(),
+    ];
+    const { result: output } = await compactSession(messages, config, jevFetch(() => 0.95));
+    expect(output.stats.relaysDropped).toBe(1);
+    expect(summarize(output)).toMatch(/1 relays dropped/);
+  });
+});
+
+describe('last compaction record', () => {
+  const stats = {
+    messagesBefore: 8,
+    messagesAfter: 6,
+    charsBefore: 900,
+    charsAfter: 300,
+    calls: 1,
+    kept: 1,
+    resultsDropped: 0,
+    callsDropped: 0,
+    pinned: 0,
+    relaysDropped: 2,
+    stateTokens: 12,
+    stateStage: 'full',
+    requests: 1,
+    ms: 5,
+  };
+
+  function fakeHost(setImpl?: (key: string, value: unknown) => Promise<void>) {
+    const written: { key: string; value: unknown }[] = [];
+    const logs: string[] = [];
+    const $ = {
+      session: { id: async () => 'ses-42' },
+      store: {
+        set:
+          setImpl ??
+          (async (key: string, value: unknown) => {
+            written.push({ key, value });
+          }),
+      },
+      ui: {
+        log: (text: string) => {
+          logs.push(text);
+        },
+      },
+    };
+    return { $, written, logs };
+  }
+
+  it('persists the applied record with session id, timestamp and stats under one key', async () => {
+    const { $, written } = fakeHost();
+    const before = Date.now();
+    await persistLastCompaction($, { applied: true, stats });
+    expect(written).toHaveLength(1);
+    expect(written[0]!.key).toBe('lastCompaction');
+    const record = written[0]!.value as Record<string, unknown>;
+    expect(record.sessionId).toBe('ses-42');
+    expect(record.applied).toBe(true);
+    expect(record.timestamp).toBeGreaterThanOrEqual(before);
+    expect(record.stats).toEqual(stats);
+    expect(record.fallbackReason).toBeUndefined();
+  });
+
+  it('records a below-minimum fallback with its stats and reason', async () => {
+    const { $, written } = fakeHost();
+    await persistLastCompaction($, {
+      applied: false,
+      stats,
+      fallbackReason: 'below-min-reduction',
+    });
+    const record = written[0]!.value as Record<string, unknown>;
+    expect(record.applied).toBe(false);
+    expect(record.fallbackReason).toBe('below-min-reduction');
+    expect(record.stats).toEqual(stats);
+  });
+
+  it('records an error fallback without stats and caps the reason', async () => {
+    const { $, written } = fakeHost();
+    await persistLastCompaction($, { applied: false, fallbackReason: `boom ${'x'.repeat(500)}` });
+    const record = written[0]!.value as Record<string, unknown>;
+    expect(record.applied).toBe(false);
+    expect(record.stats).toBeUndefined();
+    expect(record.fallbackReason).toHaveLength(200);
+  });
+
+  it('skips the record without failing the compaction when the store rejects', async () => {
+    const { $, logs } = fakeHost(async () => {
+      throw new Error('store full');
+    });
+    await expect(persistLastCompaction($, { applied: true, stats })).resolves.toBeUndefined();
+    expect(logs).toHaveLength(1);
+    expect(logs[0]).toMatch(/last-compaction record skipped \(store full\)/);
   });
 });
