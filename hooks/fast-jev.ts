@@ -139,9 +139,11 @@ export function toSessionMessages(
     for (const tool of message.toolUses) uses.set(tool, tool);
     for (const result of message.toolResults ?? []) results.set(result, result);
   }
-  return output.map((message) => {
+  // A message kept with its handle comes back whole, with every note the engine stapled to it. Only the last
+  // keeps its handle, so those notes ride once; the rest are rebuilt, which also drops images in old tool results.
+  return output.map((message, index) => {
     const own = messages.get(message);
-    if (own) return own;
+    if (own && index === output.length - 1) return own;
     const rebuilt: SessionMessage = {
       role: message.role,
       text: message.text,
