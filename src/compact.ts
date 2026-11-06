@@ -254,16 +254,39 @@ function count(decisions: readonly CallDecision[], reason: CallDecision['reason'
  * sent as state with every batch of questions. Throws when Jev fails or the
  * history cannot be fitted; the caller decides whether to fall back.
  */
+/**
+ * A message relayed into the chat from another session (mesh daemons, peer chats, subagent hand-backs):
+ * a user turn starting "Another Claude session sent a message:". The owner's own words and the assistant's
+ * replies are the chat history; relays live in the mesh log and the board, so they are dropped at compaction.
+ */
+export function isLivenessRelay(message: Message): boolean {
+  if (message.role !== 'user' || message.toolUses.length > 0 || (message.toolResults ?? []).length > 0) return false;
+  return message.text.trimStart().startsWith('Another Claude session sent a message:');
+}
+
+/** Drops relayed messages outside the preserved recent tail; the owner's words and every assistant reply stay. */
+export function dropLivenessRelays(messages: readonly Message[], preserveRecent: number): Message[] {
+  const cut = Math.max(0, messages.length - preserveRecent);
+  const out: Message[] = [];
+  for (let i = 0; i < messages.length; i++) {
+    const message = messages[i]!;
+    if (i < cut && isLivenessRelay(message)) continue;
+    out.push(message);
+  }
+  return out;
+}
+
 export async function compact(
-  messages: readonly Message[],
+  original: readonly Message[],
   asker: JevAsker,
   options: CompactOptions = {},
 ): Promise<CompactResult> {
   const started = Date.now();
   const resolved = resolveOptions(options);
+  const charsBefore = original.reduce((sum, message) => sum + messageChars(message), 0);
+  const messages = dropLivenessRelays(original, resolved.preserveRecentMessages);
   const calls = collectToolCalls(messages, resolved.preserveRecentMessages);
   const candidates = calls.filter((call) => !call.pinned);
-  const charsBefore = messages.reduce((sum, message) => sum + messageChars(message), 0);
 
   let fitted: { tokens: number; stage: string } = { tokens: 0, stage: '' };
   let batches: ToolCall[][] = [];
@@ -291,7 +314,7 @@ export async function compact(
     messages: kept,
     decisions,
     stats: {
-      messagesBefore: messages.length,
+      messagesBefore: original.length,
       messagesAfter: kept.length,
       charsBefore,
       charsAfter: kept.reduce((sum, message) => sum + messageChars(message), 0),
