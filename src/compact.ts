@@ -278,7 +278,7 @@ export function dropLivenessRelays(messages: readonly Message[], preserveRecent:
 
 export async function compact(
   original: readonly Message[],
-  asker: JevAsker,
+  asker: JevAsker | null,
   options: CompactOptions = {},
 ): Promise<CompactResult> {
   const started = Date.now();
@@ -291,7 +291,7 @@ export async function compact(
   let fitted: { tokens: number; stage: string } = { tokens: 0, stage: '' };
   let batches: ToolCall[][] = [];
   const answers = new Map<string, CallAnswer>();
-  if (candidates.length > 0) {
+  if (candidates.length > 0 && asker) {
     const state = fitState(messages, calls, resolved);
     fitted = state;
     batches = batchCalls(candidates, state.tokens, resolved);
@@ -299,6 +299,9 @@ export async function compact(
       batches.map((batch) => askBatch(asker, state.state, batch)),
     );
     for (const map of answered) for (const [id, answer] of map) answers.set(id, answer);
+  } else {
+    // No asker (Jev unavailable): every unpinned call is dropped and the chat text stays, with no Jev state to fit.
+    for (const call of candidates) answers.set(call.id, { keepCall: 0, keepResult: 0 });
   }
 
   const decisions = calls.map((call) =>

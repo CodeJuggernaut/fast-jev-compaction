@@ -157,6 +157,20 @@ describe('compactSession', () => {
     }
   });
 
+  it('compacts a long chat without Jev where building Jev state would overflow', async () => {
+    const long: SessionMessage[] = [message('user', 'start')];
+    for (let i = 0; i < 600; i++) {
+      long.push(message('assistant', 'Checking.', { toolUses: [{ tool_use_id: `c${i}`, tool: 'Bash', input: { command: 'ls' }, text: 'ok' }] }));
+      long.push(message('user', '', { toolResults: [{ tool_use_id: `c${i}`, text: 'ok', isError: false }] }));
+    }
+    long.push(message('user', 'done?'));
+    const { result: output, messages, jevError } = await compactSession(long, resolveHookConfig({}), jevFetch(() => 0.9));
+    expect(jevError).toMatch(/TYPESAFE_API_KEY/);
+    expect(output.stats.callsDropped).toBe(output.stats.calls - output.stats.pinned);
+    expect(output.stats.requests).toBe(0);
+    expect(messages.filter((m) => m.text === 'Checking.').length).toBeGreaterThan(590);
+  });
+
   it('reports no Jev error when Jev answers', async () => {
     const config = { ...resolveHookConfig({ preserveRecentMessages: 1 }), apiKey: 'k' };
     expect((await compactSession(transcript(), config, jevFetch(() => 0.9))).jevError).toBeUndefined();

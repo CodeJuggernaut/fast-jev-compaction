@@ -165,13 +165,6 @@ export type SessionCompaction = {
   jevError?: string;
 };
 
-/** Answers every question "no": every tool call outside the pinned first and newest messages is dropped. */
-export const dropAllAsker: JevAsker = {
-  async ask(_state, questions) {
-    return { answers: Object.fromEntries(Object.keys(questions).map((name) => [name, { noul: 0 }])) };
-  },
-};
-
 /**
  * Runs the library over a session transcript. When the key is missing or Jev fails (TypeSafe answered 402 from
  * 2026-11-12), it runs again without Jev: older tool calls are dropped and the chat text still stays word for word.
@@ -186,7 +179,7 @@ export async function compactSession(
     const result = await compact(messages, jevAsker(fetchFn, config.apiKey, config.model), config);
     return { result, messages: toSessionMessages(messages, result.messages) };
   } catch (error) {
-    const result = await compact(messages, dropAllAsker, config);
+    const result = await compact(messages, null, config);
     return {
       result,
       messages: toSessionMessages(messages, result.messages),
@@ -290,18 +283,18 @@ export const register: Register = (on: On, options: PluginOptions) => {
         const response = await $.http.fetch(url, init);
         return { status: response.status, ok: response.ok, text: response.text };
       });
-      if (jevError) notify($, `Jev unavailable (${jevError}): dropped older tool calls without Jev, chat kept word for word`);
       for (const line of decisionLogLines(result)) $.ui.log(line);
+      const withoutJev = jevError ? `; without Jev: ${jevError}` : '';
       if (reductionRatio(result) < config.minReductionRatio) {
         notify(
           $,
-          `fallback to built-in summary (below ${percent(config.minReductionRatio)} minimum: ${summarize(result)})`,
+          `fallback to built-in summary (below ${percent(config.minReductionRatio)} minimum: ${summarize(result)}${withoutJev})`,
         );
         return next(event);
       }
       notify(
         $,
-        `kept ${messages.length}/${event.messages.length} messages, no summary (${summarize(result)})`,
+        `kept ${messages.length}/${event.messages.length} messages, no summary (${summarize(result)}${withoutJev})`,
       );
       return { messages };
     } catch (error) {
