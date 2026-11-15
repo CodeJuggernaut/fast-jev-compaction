@@ -69,7 +69,7 @@ describe('hook config', () => {
 });
 
 describe('session message mapping', () => {
-  it('returns the engine objects for untouched messages and handle-less copies for rebuilt ones', () => {
+  it('keeps the engine object only for the last message and rebuilds the rest without handles', () => {
     const messages = transcript();
     const calls = collectToolCalls(messages, 0);
     const decisions = [
@@ -80,7 +80,7 @@ describe('session message mapping', () => {
     messages[2]!.toolResults![0]!.text = 'x'.repeat(2000);
     const out = toSessionMessages(messages, applyDecisions(messages, decisions, calls, 300));
     expect(out).toHaveLength(messages.length);
-    expect(out[0]).toBe(messages[0]);
+    expect(out[0]).toEqual({ role: 'user', text: 'Fix the failing test.', toolUses: [] });
     expect(out[1]?.handle).toBeUndefined();
     expect(out[1]?.toolUses[0]?.text).toMatch(
       new RegExp(`^${'x'.repeat(300)}\\n\\[fast-jev-compaction truncated 1700 chars`),
@@ -90,11 +90,11 @@ describe('session message mapping', () => {
       new RegExp(`^${'x'.repeat(300)}\\n\\[fast-jev-compaction truncated 1700 chars`),
     );
     expect(out[2]?.toolResults?.[0]).toMatchObject({ tool_use_id: 'tool-1', isError: false });
-    expect(out[3]).toBe(messages[3]);
-    expect(out[4]).toBe(messages[4]);
+    expect(out.slice(0, -1).every((m) => m.handle === undefined)).toBe(true);
+    expect(out.at(-1)).toBe(messages.at(-1));
   });
 
-  it('preserves short dropped-result messages and their handles', () => {
+  it('keeps short dropped results whole', () => {
     const messages = transcript();
     messages[1]!.toolUses[0]!.text = 'y'.repeat(100);
     messages[2]!.toolResults![0]!.text = 'y'.repeat(100);
@@ -104,8 +104,8 @@ describe('session message mapping', () => {
       decideCall(calls[1]!, { keepCall: 0.9, keepResult: 0.9 }, { keepThreshold: 0.5 }),
     ];
     const out = toSessionMessages(messages, applyDecisions(messages, decisions, calls, 300));
-    expect(out[1]).toBe(messages[1]);
-    expect(out[2]).toBe(messages[2]);
+    expect(out[1]?.toolUses[0]?.text).toBe('y'.repeat(100));
+    expect(out[2]?.toolResults?.[0]?.text).toBe('y'.repeat(100));
   });
 });
 
@@ -121,7 +121,7 @@ describe('compactSession', () => {
     expect(bodies).toHaveLength(1);
     expect(JSON.parse(bodies[0]!).model).toBe('jev-x');
     expect(output.decisions.map((d) => d.action)).toEqual(['drop_call', 'keep']);
-    expect(messages.map((m) => m.handle)).toEqual(['h-0', 'h-tool-2', 'r-tool-2', 'h-5', 'h-6']);
+    expect(messages.map((m) => m.handle)).toEqual([undefined, undefined, undefined, undefined, 'h-6']);
     expect(summarize(output)).toMatch(/^\d+% reduction; 1 kept, 1 call_dropped; state ~\d+ tokens \(full\) in 1 request\(s\)$/);
     expect(decisionLog(output)).toBe('t1:Read:drop_call/call=0.10/result=0.10 t2:Bash:keep/call=0.90/result=0.90');
     expect(decisionLogLines(output)).toEqual([`decisions: ${decisionLog(output)}`]);
@@ -139,11 +139,40 @@ describe('compactSession', () => {
     expect(decisionLogLines({ ...output, decisions: [] })).toEqual(['decisions: (none)']);
   });
 
-  it('throws on a missing key and on failed requests so the hook falls back', async () => {
+  it('drops older tool calls without Jev on a missing key or a failed request, and keeps the chat text', async () => {
     const config = resolveHookConfig({ preserveRecentMessages: 1 });
-    await expect(compactSession(transcript(), config, jevFetch(() => 0))).rejects.toThrow(/TYPESAFE_API_KEY/);
-    await expect(
-      compactSession(transcript(), { ...config, apiKey: 'k' }, async () => ({ status: 500, ok: false, text: 'x' })),
-    ).rejects.toThrow(/500/);
+    const cases = [
+      { config, fetchFn: jevFetch(() => 0.9), error: /TYPESAFE_API_KEY/ },
+      { config: { ...config, apiKey: 'k' }, fetchFn: async () => ({ status: 402, ok: false, text: 'x' }), error: /402/ },
+    ];
+    for (const { config: c, fetchFn, error } of cases) {
+      const { result: output, messages, jevError } = await compactSession(transcript(), c, fetchFn);
+      expect(jevError).toMatch(error);
+      expect(output.decisions.map((d) => d.action)).toEqual(['drop_call', 'drop_call']);
+      expect(messages.map((m) => [m.role, m.text])).toEqual([
+        ['user', 'Fix the failing test.'],
+        ['assistant', 'Fixing now.'],
+        ['user', 'go ahead'],
+      ]);
+    }
+  });
+
+  it('compacts a long chat without Jev where building Jev state would overflow', async () => {
+    const long: SessionMessage[] = [message('user', 'start')];
+    for (let i = 0; i < 600; i++) {
+      long.push(message('assistant', 'Checking.', { toolUses: [{ tool_use_id: `c${i}`, tool: 'Bash', input: { command: 'ls' }, text: 'ok' }] }));
+      long.push(message('user', '', { toolResults: [{ tool_use_id: `c${i}`, text: 'ok', isError: false }] }));
+    }
+    long.push(message('user', 'done?'));
+    const { result: output, messages, jevError } = await compactSession(long, resolveHookConfig({}), jevFetch(() => 0.9));
+    expect(jevError).toMatch(/TYPESAFE_API_KEY/);
+    expect(output.stats.callsDropped).toBe(output.stats.calls - output.stats.pinned);
+    expect(output.stats.requests).toBe(0);
+    expect(messages.filter((m) => m.text === 'Checking.').length).toBeGreaterThan(590);
+  });
+
+  it('reports no Jev error when Jev answers', async () => {
+    const config = { ...resolveHookConfig({ preserveRecentMessages: 1 }), apiKey: 'k' };
+    expect((await compactSession(transcript(), config, jevFetch(() => 0.9))).jevError).toBeUndefined();
   });
 });
