@@ -161,17 +161,38 @@ export function toSessionMessages(
 export type SessionCompaction = {
   result: CompactResult;
   messages: SessionMessage[];
+  /** Why Jev could not judge, when the no-Jev path ran instead. */
+  jevError?: string;
 };
 
-/** Runs the library over a session transcript; throws when the key is missing or Jev fails. */
+/** Answers every question "no": every tool call outside the pinned first and newest messages is dropped. */
+export const dropAllAsker: JevAsker = {
+  async ask(_state, questions) {
+    return { answers: Object.fromEntries(Object.keys(questions).map((name) => [name, { noul: 0 }])) };
+  },
+};
+
+/**
+ * Runs the library over a session transcript. When the key is missing or Jev fails (TypeSafe answered 402 from
+ * 2026-11-12), it runs again without Jev: older tool calls are dropped and the chat text still stays word for word.
+ */
 export async function compactSession(
   messages: readonly SessionMessage[],
   config: HookConfig,
   fetchFn: HookFetch,
 ): Promise<SessionCompaction> {
-  if (!config.apiKey) throw new Error('TYPESAFE_API_KEY is not configured');
-  const result = await compact(messages, jevAsker(fetchFn, config.apiKey, config.model), config);
-  return { result, messages: toSessionMessages(messages, result.messages) };
+  try {
+    if (!config.apiKey) throw new Error('TYPESAFE_API_KEY is not configured');
+    const result = await compact(messages, jevAsker(fetchFn, config.apiKey, config.model), config);
+    return { result, messages: toSessionMessages(messages, result.messages) };
+  } catch (error) {
+    const result = await compact(messages, dropAllAsker, config);
+    return {
+      result,
+      messages: toSessionMessages(messages, result.messages),
+      jevError: error instanceof Error ? error.message : String(error),
+    };
+  }
 }
 
 function percent(ratio: number): string {
@@ -265,10 +286,11 @@ export const register: Register = (on: On, options: PluginOptions) => {
   on('session.compact', async ($, event, next) => {
     try {
       const config = { ...configured, apiKey: await getApiKey($, configured) };
-      const { result, messages } = await compactSession(event.messages, config, async (url, init) => {
+      const { result, messages, jevError } = await compactSession(event.messages, config, async (url, init) => {
         const response = await $.http.fetch(url, init);
         return { status: response.status, ok: response.ok, text: response.text };
       });
+      if (jevError) notify($, `Jev unavailable (${jevError}): dropped older tool calls without Jev, chat kept word for word`);
       for (const line of decisionLogLines(result)) $.ui.log(line);
       if (reductionRatio(result) < config.minReductionRatio) {
         notify(
