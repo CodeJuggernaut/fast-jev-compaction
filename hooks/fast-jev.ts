@@ -21,7 +21,6 @@ import type {
 
 const HOOK_DEFAULTS = {
   compactAtPercent: 60,
-  minReductionRatio: 0.25,
   model: DEFAULT_MODEL,
 };
 
@@ -43,7 +42,6 @@ export type HookFetch = (url: string, init?: HookFetchInit) => Promise<HookFetch
 export type HookConfig = CompactOptions & {
   apiKey?: string;
   compactAtPercent: number;
-  minReductionRatio: number;
   model: string;
 };
 
@@ -73,11 +71,6 @@ export function resolveHookConfig(options: PluginOptions): HookConfig {
   const config: HookConfig = {
     ...numbers,
     compactAtPercent: optionNumber(options, 'compactAtPercent', HOOK_DEFAULTS.compactAtPercent),
-    minReductionRatio: optionNumber(
-      options,
-      'minReductionRatio',
-      HOOK_DEFAULTS.minReductionRatio,
-    ),
     model: optionString(options, 'model') ?? HOOK_DEFAULTS.model,
   };
   const apiKey = optionString(options, 'apiKey');
@@ -298,11 +291,20 @@ function notify(
   $.ui.toast(text, { timeoutMs: 15_000 });
 }
 
+/**
+ * Every message back word for word, tool data included. The answer when pruning fails or runs out of time: the
+ * built-in summary never replaces the conversation (owner, 2026-11-24: "I don't want summaries").
+ */
+function keepEverything(messages: readonly SessionMessage[]): { messages: SessionMessage[] } {
+  return { messages: toSessionMessages(messages, messages) };
+}
+
 export const register: Register = (on: On, options: PluginOptions) => {
   const configured = resolveHookConfig(options);
   let compacting = false;
 
-  on('session.compact', async ($, event, next) => {
+  // Never calls next(event): below it, core's built-in summary would replace the conversation.
+  on('session.compact', async ($, event) => {
     try {
       const config = { ...configured, apiKey: await getApiKey($, configured) };
       const { result, messages, jevError } = await compactSession(event.messages, config, async (url, init) => {
@@ -311,13 +313,6 @@ export const register: Register = (on: On, options: PluginOptions) => {
       }, await sharedCli($));
       for (const line of decisionLogLines(result)) $.ui.log(line);
       const withoutJev = jevError ? `; without Jev: ${jevError}` : '';
-      if (reductionRatio(result) < config.minReductionRatio) {
-        notify(
-          $,
-          `fallback to built-in summary (below ${percent(config.minReductionRatio)} minimum: ${summarize(result)}${withoutJev})`,
-        );
-        return next(event);
-      }
       notify(
         $,
         `kept ${messages.length}/${event.messages.length} messages, no summary (${summarize(result)}${withoutJev})`,
@@ -326,10 +321,17 @@ export const register: Register = (on: On, options: PluginOptions) => {
     } catch (error) {
       notify(
         $,
-        `fallback to built-in summary (${error instanceof Error ? error.message : String(error)})`,
+        `kept all ${event.messages.length} messages, no summary (pruning failed: ${error instanceof Error ? error.message : String(error)})`,
       );
-      return next(event);
+      return keepEverything(event.messages);
     }
+  }).catch(($, event, next) => {
+    // Runs when the hook above overran its time budget or failed in a way it could not catch itself.
+    notify(
+      $,
+      `kept all ${event.messages.length} messages, no summary (hook ${next.error.kind}${next.error.message ? `: ${next.error.message}` : ''})`,
+    );
+    return keepEverything(event.messages);
   });
 
   on('turn.complete', async ($, event: TurnCompleteInput, next) => {
