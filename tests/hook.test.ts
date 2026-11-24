@@ -176,3 +176,17 @@ describe('compactSession', () => {
     expect((await compactSession(transcript(), config, jevFetch(() => 0.9))).jevError).toBeUndefined();
   });
 });
+
+describe('shared CLI runner', () => {
+  it('uses the external result when it works and the bundled engine when it throws', async () => {
+    const config = resolveHookConfig({});
+    const history = transcript();
+    const fake = { messages: history, decisions: [], stats: { charsBefore: 1, charsAfter: 1, kept: 0, callsDropped: 0, resultsDropped: 0 } } as never;
+    const viaCli = await compactSession(history, config, async () => ({ status: 200, ok: true, text: '{}' }), async () => fake);
+    expect(viaCli.result).toBe(fake);
+    const fallback = await compactSession(history, config, async () => ({ status: 200, ok: true, text: '{}' }), async () => {
+      throw new Error('cli down');
+    });
+    expect(fallback.result).not.toBe(fake);
+  });
+});
