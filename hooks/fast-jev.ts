@@ -310,6 +310,7 @@ export const register: Register = (on: On, options: PluginOptions) => {
     if (compacting) return next(event);
     try {
       const { context } = await $.session.usage();
+      await $.fs.write(`${(await $.env.get('USERPROFILE')) ?? ''}/.config/code-ninja/compact-trigger.json`, JSON.stringify({ at: new Date().toISOString(), percent: context.percent ?? null, tokens: context.tokens ?? null, window: context.window, threshold: configured.compactAtPercent }));
       if ((context.percent ?? 0) < configured.compactAtPercent) return next(event);
       compacting = true;
       await $.session.compact();
