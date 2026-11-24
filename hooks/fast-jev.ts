@@ -173,7 +173,16 @@ export async function compactSession(
   messages: readonly SessionMessage[],
   config: HookConfig,
   fetchFn: HookFetch,
+  external?: (messages: readonly SessionMessage[]) => Promise<CompactResult>,
 ): Promise<SessionCompaction> {
+  if (external) {
+    try {
+      const result = await external(messages);
+      return { result, messages: toSessionMessages(messages, result.messages) };
+    } catch {
+      // The shared CLI is the live copy of the engine; when it cannot run, the bundled engine below does the job.
+    }
+  }
   try {
     if (!config.apiKey) throw new Error('TYPESAFE_API_KEY is not configured');
     const result = await compact(messages, jevAsker(fetchFn, config.apiKey, config.model), config);
@@ -259,6 +268,23 @@ async function getApiKey(
   return undefined;
 }
 
+/** Runs the shared CLI that npm run install:jev points at, so a new engine build applies to this live chat with no plugin reload. */
+async function sharedCli($: {
+  env: { get: (name: string) => Promise<string | undefined> };
+  fs: { read: (path: string) => Promise<string> };
+  process: { run: (argv: readonly string[], init?: { stdin?: string; timeoutMs?: number }) => Promise<{ exitCode: number; stdout: string; stderr: string }> };
+}): Promise<((messages: readonly SessionMessage[]) => Promise<CompactResult>) | undefined> {
+  const home = (await $.env.get('USERPROFILE')) ?? (await $.env.get('HOME'));
+  const cli = home ? (await $.fs.read(`${home}/.config/code-ninja/jev-compact-cli.txt`).catch(() => '')).trim() : '';
+  if (!cli) return undefined;
+  return async (messages) => {
+    const plain = messages.map(({ role, text, toolUses, toolResults }) => ({ role, text, toolUses, toolResults }));
+    const run = await $.process.run(['node', cli], { stdin: JSON.stringify(plain), timeoutMs: 120_000 });
+    if (run.exitCode !== 0) throw new Error(run.stderr.slice(0, 200));
+    return JSON.parse(run.stdout) as CompactResult;
+  };
+}
+
 function notify(
   $: {
     ui: {
@@ -282,7 +308,7 @@ export const register: Register = (on: On, options: PluginOptions) => {
       const { result, messages, jevError } = await compactSession(event.messages, config, async (url, init) => {
         const response = await $.http.fetch(url, init);
         return { status: response.status, ok: response.ok, text: response.text };
-      });
+      }, await sharedCli($));
       for (const line of decisionLogLines(result)) $.ui.log(line);
       const withoutJev = jevError ? `; without Jev: ${jevError}` : '';
       if (reductionRatio(result) < config.minReductionRatio) {
