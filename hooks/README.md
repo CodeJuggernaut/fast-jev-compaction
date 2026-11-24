@@ -51,7 +51,6 @@ The plugin declares these `userConfig` values in
 | `keepThreshold` | `0.5` |
 | `preserveRecentMessages` | `6` |
 | `compactAtPercent` | `60` |
-| `minReductionRatio` | `0.25` |
 | `maxStateTokens` | `25000` |
 | `maxRequestTokens` | `30000` |
 | `truncateHeadChars` | `300` |
@@ -61,13 +60,13 @@ The TypeSafe key can be supplied as the sensitive `apiKey` plugin option or
 through `TYPESAFE_API_KEY`. The environment variable is the recommended
 development setup.
 
-Every option except `apiKey`, `compactAtPercent`, `minReductionRatio` and
-`model` is passed straight to the library; see the root README for what they
-do. The `session.compact` hook runs the Jev requests concurrently. If Jev fails,
-the response is malformed, the key is unavailable, the history cannot be
-fitted into the state budget, or the estimated reduction is below
-`minReductionRatio`, the hook logs a fallback and delegates to Claude Code's
-built-in compaction. The outcome is shown as a toast and logged with the
+Every option except `apiKey`, `compactAtPercent` and `model` is passed
+straight to the library; see the root README for what they do. The
+`session.compact` hook runs the Jev requests concurrently. It never delegates
+to Claude Code's built-in summary: when Jev fails or the key is unavailable it
+prunes without Jev, it returns the pruned history however small the reduction
+is, and when pruning throws, or the hook overruns its time budget, it returns
+every message unchanged. The outcome is shown as a toast and logged with the
 reduction, per-reason counts, state size and request count; a per-call
 `decisions:` line with both probabilities is logged for diagnosis. The
 `turn.complete` hook requests

@@ -28,12 +28,6 @@
       "description": "Context percentage at which turn.complete requests compaction.",
       "default": 60
     },
-    "minReductionRatio": {
-      "type": "number",
-      "title": "Minimum reduction ratio",
-      "description": "Minimum estimated character reduction required to replace history.",
-      "default": 0.25
-    },
     "maxStateTokens": {
       "type": "number",
       "title": "Maximum Jev state tokens",

@@ -1,8 +1,9 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import {
   compactSession,
   decisionLog,
   decisionLogLines,
+  register,
   resolveHookConfig,
   summarize,
   toSessionMessages,
@@ -53,7 +54,7 @@ function jevFetch(answer: (name: string) => number, bodies: string[] = []) {
 
 describe('hook config', () => {
   it('reads userConfig values and falls back to defaults', () => {
-    expect(resolveHookConfig({})).toEqual({ compactAtPercent: 60, minReductionRatio: 0.25, model: 'jev-latest' });
+    expect(resolveHookConfig({})).toEqual({ compactAtPercent: 60, model: 'jev-latest' });
     expect(
       resolveHookConfig({ apiKey: 'k', keepThreshold: 0.3, maxStateTokens: 1000, model: 'jev-x', goal: 'g', compactAtPercent: 'no' }),
     ).toEqual({
@@ -63,7 +64,6 @@ describe('hook config', () => {
       model: 'jev-x',
       goal: 'g',
       compactAtPercent: 60,
-      minReductionRatio: 0.25,
     });
   });
 });
@@ -188,5 +188,72 @@ describe('shared CLI runner', () => {
       throw new Error('cli down');
     });
     expect(fallback.result).not.toBe(fake);
+  });
+});
+
+describe('session.compact never uses the built-in summary', () => {
+  type Handler = ($: unknown, event: { messages: SessionMessage[] }, next: unknown) => Promise<unknown> | unknown;
+
+  function registered() {
+    const hooks: Record<string, Handler> = {};
+    const catches: Record<string, Handler> = {};
+    const on = (name: string, hook: Handler) => {
+      hooks[name] = hook;
+      return { catch: (handler: Handler) => (catches[name] = handler) };
+    };
+    register(on as never, {});
+    return { hook: hooks['session.compact'], onFailure: catches['session.compact'] };
+  }
+
+  function host(settings: () => Promise<Record<string, unknown>> = async () => ({})) {
+    const toasts: string[] = [];
+    const $ = {
+      ui: { log: () => {}, toast: (text: string) => toasts.push(text) },
+      env: { get: async () => undefined },
+      settings: { read: settings },
+      fs: { read: async () => { throw new Error('no CLI file'); } },
+      http: { fetch: async () => ({ status: 402, ok: false, text: 'no credit' }) },
+      process: { run: async () => ({ exitCode: 1, stdout: '', stderr: '' }) },
+    };
+    return { $, toasts };
+  }
+
+  const texts = (messages: readonly SessionMessage[]) => messages.map((m) => m.text);
+
+  it('returns the pruned chat even when almost nothing could be cut', async () => {
+    const chat = [
+      message('user', 'How are the seedlings?', { handle: 'a' }),
+      message('assistant', 'Two leaves each, all upright.', { handle: 'b' }),
+      message('user', 'Good, water them tonight.', { handle: 'c' }),
+    ];
+    const { $, toasts } = host();
+    const next = vi.fn();
+    const out = (await registered().hook($, { messages: chat }, next)) as { messages: SessionMessage[] };
+    expect(next).not.toHaveBeenCalled();
+    expect(texts(out.messages)).toEqual(texts(chat));
+    expect(toasts[0]).toMatch(/^kept 3\/3 messages, no summary \(0% reduction/);
+  });
+
+  it('keeps every message unchanged when pruning throws', async () => {
+    const chat = transcript();
+    const { $, toasts } = host(async () => { throw new Error('settings unreadable'); });
+    const next = vi.fn();
+    const out = (await registered().hook($, { messages: chat }, next)) as { messages: SessionMessage[] };
+    expect(next).not.toHaveBeenCalled();
+    expect(out.messages).toHaveLength(chat.length);
+    expect(texts(out.messages)).toEqual(texts(chat));
+    expect(out.messages.map((m) => m.toolResults?.map((r) => r.text))).toEqual(chat.map((m) => m.toolResults?.map((r) => r.text)));
+    expect(out.messages.at(-1)).toBe(chat.at(-1));
+    expect(toasts[0]).toBe('kept all 7 messages, no summary (pruning failed: settings unreadable)');
+  });
+
+  it('keeps every message unchanged when the hook overruns its budget', async () => {
+    const chat = transcript();
+    const { $, toasts } = host();
+    const next = Object.assign(vi.fn(), { error: { kind: 'timeout', budget: 10_000 }, called: false });
+    const out = (await registered().onFailure($, { messages: chat }, next)) as { messages: SessionMessage[] };
+    expect(next).not.toHaveBeenCalled();
+    expect(texts(out.messages)).toEqual(texts(chat));
+    expect(toasts[0]).toBe('kept all 7 messages, no summary (hook timeout)');
   });
 });
