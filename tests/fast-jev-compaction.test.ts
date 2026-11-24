@@ -379,6 +379,13 @@ describe('compact', () => {
     expect(reductionRatio(output)).toBe(0);
   });
 
+  it('keeps a relayed peer message word for word outside the recent tail', async () => {
+    const relay = 'Another Claude session sent a message:\n<cross-session-message>Owner order: keep this.</cross-session-message>';
+    const history = [message('user', 'start'), message('user', relay), message('assistant', 'ok'), message('user', 'latest')];
+    const out = await compact(history, null, { preserveRecentMessages: 1 });
+    expect(out.messages.map((m) => m.text)).toContain(relay);
+  });
+
   it('rejects malformed answers', async () => {
     const broken: JevAsker = {
       ask: async () => ({ answers: { call_t1: { noul: 0.5 } } }),
